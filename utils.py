@@ -35,7 +35,7 @@ def load_data(args, dataset="cora", classes_per_task=2):
         idx = np.array(idx_features_labels[:,0],dtype=np.dtype(str))
         idx_map = {j: i for i,j in enumerate(idx)}
         edges_unordered = np.genfromtxt("{}{}.cites".format(path,dataset), dtype=np.dtype(str))
-        edges = np.array(list(map(idx_map.get, edges_unordered.flatten())), dtype=np.dtype(str)).reshape(edges_unordered.shape)
+        edges = np.array(list(map(idx_map.get, edges_unordered.flatten())), dtype=np.dtype(int)).reshape(edges_unordered.shape)
 
         adj = sp.coo_matrix((np.ones(edges.shape[0]), (edges[:,0], edges[:,1])), shape=(labels.shape[0], labels.shape[0]), dtype=np.float32)
         adj = adj + adj.T.multiply(adj.T>adj) - adj.multiply(adj.T>adj)
@@ -58,6 +58,7 @@ def load_data(args, dataset="cora", classes_per_task=2):
         adj = adj_masking(adj, handle, device)
         features = feature_masking(features, handle)
         labels = label_masking(labels, handle)
+
         index = list(range(len(labels)))
 
         sorted_ids = sorted(selected_ids)
@@ -89,16 +90,16 @@ def load_data(args, dataset="cora", classes_per_task=2):
             test_ratio = [0.15, 0.6]
             for i in range(len(index_per_class)):
                 class_train, class_test = train_test_split(index_per_class[i], test_size=test_ratio[i], random_state=1)
-                class_train = torch.LongTensor(class_train)
-                class_test = torch.LongTensor(class_test)
                 if idx_train == None:
                     idx_train = class_train
                 else:
-                    idx_train = torch.cat((idx_train, class_train), dim=-1)
+                    idx_train = idx_train + class_train
                 if idx_test == None:
                     idx_test = class_test
                 else:
-                    idx_test = torch.cat((idx_test, class_test), dim=-1)
+                    idx_test = idx_test + class_test
+        
+        edge_index = adjacency_to_edge_index(adj, device)
         
 
     elif dataset == 'amazoncobuy':
@@ -157,35 +158,36 @@ def load_data(args, dataset="cora", classes_per_task=2):
         test_ratio = [0.3, 0.75, 0.65, 0.3, 0.9, 0.3, 0.4, 0.75]
         for i in range(len(selected_ids)):
             class_train, class_test = train_test_split(index_per_class[i], test_size=test_ratio[i], random_state=1)
-            class_train = torch.LongTensor(class_train)
-            class_test = torch.LongTensor(class_test)
             if idx_train == None:
                 idx_train = class_train
             else:
-                idx_train = torch.cat((idx_train, class_train), dim=-1)
+                idx_train = idx_train + class_train
             if idx_test == None:
                 idx_test = class_test
             else:
-                idx_test = torch.cat((idx_test, class_test), dim=-1)
+                idx_test = idx_test + class_test
+        
+        edge_index = adjacency_to_edge_index(adj, device)
 
     elif dataset == 'ogb_arxiv':
         Data = PygNodePropPredDataset(name = 'ogbn-arxiv')
         index = list(range(len(Data.data.x)))
         edges = Data.data.edge_index
         num_nodes = max(max(edges[0]), max(edges[1])) + 1
-        adj = sp.coo_matrix((np.ones(len(edges[0])), (edges[0], edges[1])), shape=(num_nodes, num_nodes))
-        adj = adj + adj.T.multiply(adj.T>adj) - adj.multiply(adj.T>adj)
-        adj = normalize_adj(adj+sp.eye(adj.shape[0]))
-        adj = torch.FloatTensor(np.array(adj.todense()))
         features = Data.data.x
         labels = Data.data.y.squeeze()
         labels_np = labels.numpy()
         label_counter = collections.Counter(labels_np)
-        selected_ids = [id for id, count in label_counter.items() if count > 400]
+        selected_ids = [id for id, count in label_counter.items() if count > 2830]
         selected_ids = sorted(selected_ids)
         handle = [item for item in index if labels[item] in selected_ids]
         device = torch.device('cuda:0' if(torch.cuda.is_available()) else 'cpu')
-        adj = adj_masking(adj, handle, device)
+        edge_index = edge_masking(edges, handle, device)
+        matching_index_inv = {}
+        for idx in range(len(handle)):
+            matching_index_inv[int(handle[idx])] = torch.tensor(idx).to(device)
+        edge_index = torch.tensor([[matching_index_inv[edge[0].item()] for edge in edge_index.t()], [matching_index_inv[edge[1].item()] for edge in edge_index.t()]], dtype=torch.int64)
+
         features = feature_masking(features, handle)
         labels = label_masking(labels, handle)
         index = list(range(len(labels)))
@@ -202,6 +204,21 @@ def load_data(args, dataset="cora", classes_per_task=2):
         features = torch.FloatTensor(features)
         total_classes = int(max(labels))+1
         num_classes = len(selected_ids)
+
+        idx_train, idx_test = None, None
+
+        test_ratio = [0.3, 0.3, 0.3, 0.3, 0.35, 0.85, 0.2, 0.2, 0.8, 0.3, 0.3, 0.8, 0.4, 0.35, 0.25]
+        for i in range(len(selected_ids)):
+            class_train, class_test = train_test_split(index_per_class[i], test_size=test_ratio[i], random_state=1)
+            if idx_train == None:
+                idx_train = class_train
+            else:
+                idx_train = idx_train + class_train
+            if idx_test == None:
+                idx_test = class_test
+            else:
+                idx_test = idx_test + class_test
+        
 
     train = {}
     partition = {}
@@ -245,9 +262,8 @@ def load_data(args, dataset="cora", classes_per_task=2):
 
     for i in range(num_tasks):
         train[i] = torch.LongTensor(train[i])
-    
 
-    return adj, features, labels, train, total_classes, partition, train_per_class, test_per_class, class_idx
+    return edge_index, features, labels, train, total_classes, partition, train_per_class, test_per_class, class_idx
 
 
 def adj_masking(adj, handled, device):
@@ -258,6 +274,18 @@ def adj_masking(adj, handled, device):
     D_tilde_inv_sqrt = torch.diag(torch.sqrt(torch.sum(A_tilde, dim = 1)) ** -1)
     adj = torch.mm(D_tilde_inv_sqrt, torch.mm(A_tilde, D_tilde_inv_sqrt)).to(device)
     return adj
+    
+def edge_masking(edge_index, handled, device):
+    num_nodes = edge_index.max().item()+1
+    node_mask = torch.zeros(num_nodes, dtype=torch.bool)
+    for node in handled:
+        node_mask[node] = True
+    mask = node_mask[edge_index[0]] & node_mask[edge_index[1]]
+    edge_index = edge_index[:, mask].to(device)
+    self_loop_indices = torch.tensor([[node, node] for node in handled], dtype=torch.long).t().to(device)
+    edge_index = torch.cat([edge_index, self_loop_indices], dim=1).to(device)
+    edge_index = coalesce(edge_index)
+    return edge_index
 
 def feature_masking(features, handled):
     features = features[handled, :]
@@ -343,25 +371,25 @@ def edge_index_to_adjacency(edge_index, dim, device):
     return adj.to(device)
 
 
-def buffer_linkpred(model_lp, data, features, adj, train_idx, current_idx, replay_idx, distance, matching_index_inv, matching_index, replay_buffer, ori_edge_index, device, knn, thres, beta, replay):
+def buffer_linkpred(model_lp, data, features, train_idx, current_idx, replay_buffer, ori_edge_index, device, knn, thres, beta, replay):
     data = data.to(device)
     optimizer_lp = torch.optim.Adam(params=model_lp.parameters(), lr=0.01)
 
     if replay == 'C_Mf' or replay == 'MFf':
-        x_dist = torch.cdist(features, features, p=2)
+        x_dist = torch.cdist(features[replay_buffer,:], features, p=2)
     else:
         embeds = model_lp.encode(features, data.edge_index)
-        x_dist = torch.cdist(embeds, embeds, p=2)
+        x_dist = torch.cdist(embeds[replay_buffer,:], embeds, p=2)
 
-    model_lp = train_lp(model_lp, data, train_idx, current_idx, replay_idx, optimizer_lp, beta, device)
+    model_lp = train_lp(model_lp, data, train_idx, current_idx, replay_buffer, optimizer_lp, beta, device)
     z = model_lp.encode(features, data.edge_index)
     
-    buffers = torch.tensor([matching_index_inv[int(x)] for x in replay_buffer]).to(device)
+    buffers = replay_buffer.to(device)
 
     added_edge_index = None
     delete_edge_index = None
-    for buffer in buffers:
-        buffer_sim = x_dist[buffer,:]
+    for i, buffer in enumerate(buffers):
+        buffer_sim = x_dist[i,:]
         buffer_sim = torch.negative(buffer_sim)
         
         v, target = buffer_sim.topk(50)
@@ -369,20 +397,18 @@ def buffer_linkpred(model_lp, data, features, adj, train_idx, current_idx, repla
         valid_edge_index, deleted_edge_index = model_lp.decode_target(z, data.edge_index, target, buffer, knn, thres)
         valid_edge_index = valid_edge_index.to(device)
         deleted_edge_index = deleted_edge_index.to(device)
+        
         if valid_edge_index != None:
-            for i in range(valid_edge_index.size(0)):
-                valid_edge_index[i] = torch.tensor([matching_index[int(x)] for x in valid_edge_index[i]])
             if added_edge_index != None:
                 added_edge_index = torch.cat((added_edge_index, valid_edge_index), dim=-1)
             else:
                 added_edge_index = valid_edge_index
         if deleted_edge_index != None:
-            for i in range(deleted_edge_index.size(0)):
-                deleted_edge_index[i] = torch.tensor([matching_index[int(x)] for x in deleted_edge_index[i]])
             if delete_edge_index != None:
                 delete_edge_index = torch.cat((delete_edge_index, deleted_edge_index), dim=-1)
             else:
                 delete_edge_index = deleted_edge_index
+        
     ori_edge_index = torch.cat((ori_edge_index, added_edge_index), dim=-1)
     ori_edge_index = coalesce(ori_edge_index)
     
@@ -392,19 +418,19 @@ def buffer_linkpred(model_lp, data, features, adj, train_idx, current_idx, repla
         mask = ~((rows == delete_edge_index[0,i]) & (cols == delete_edge_index[1,i]))
         edge_mask &= mask
     ori_edge_index = ori_edge_index[:, edge_mask]
-
+    
     return model_lp, ori_edge_index
 
 
 def train_lp(model_lp, data, train_idx, current_idx, replay_idx, optimizer_lp, beta, device):
     valid_pos = None
     criterion = nn.CrossEntropyLoss
-    for epoch in range(1, 200):
+    for epoch in range(1, 100):
         model_lp.train()
         neg_edge_index = negative_sampling(
                         edge_index = data.edge_index,
                         num_nodes = data.num_nodes,
-                        num_neg_samples = data.edge_index.size(1))
+                        num_neg_samples = int(data.edge_index.size(1)*0.5))
         link_logits = get_link_logits(model_lp, data.x, data.edge_index, valid_pos, neg_edge_index)
         optimizer_lp.zero_grad()
         link_labels = get_link_labels(data.edge_index, neg_edge_index, device)
@@ -413,7 +439,7 @@ def train_lp(model_lp, data, train_idx, current_idx, replay_idx, optimizer_lp, b
         preds = model_lp(data.x, data.edge_index)
         current_loss = criterion()(preds[current_idx], data.y[current_idx])
         if replay_idx != None:
-            replay_loss = criterion()(torch.index_select(preds.to(device), 0, torch.tensor(replay_idx).to(device)), torch.index_select(data.y.to(device), 0, torch.tensor(replay_idx).to(device)))
+            replay_loss = criterion()(preds[replay_idx], data.y[replay_idx])
             if beta != 0:
                 label_loss = beta * current_loss + (1-beta) * replay_loss
             elif beta == 0:
@@ -447,3 +473,7 @@ def extract_edges_with_node(edge_index, node_index):
     mask = ((row == node_index) | (col == node_index))
     new_edge_index = edge_index[:, mask]
     return new_edge_index
+
+def find_connected_nodes(node, edge_index):
+    connected_nodes = edge_index[1, edge_index[0]==node]
+    return connected_nodes

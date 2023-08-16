@@ -1,5 +1,7 @@
 import random
 import matplotlib.pyplot as plt
+import time
+import copy
 
 import numpy as np 
 import torch
@@ -7,14 +9,12 @@ from kmeans_pytorch import kmeans, kmeans_predict
 from sklearn.cluster import KMeans
 
 
-def update_random(train_per_class, matching_index_inv, partition, task, size, replay_buffer, total_data):
-    purified = {}
+def update_random(train_per_class, partition, task, size, replay_buffer, total_data):
     for tasks in range(task+1):
         for i in partition[tasks]:
-            purified[i] = [matching_index_inv[int(x)] for x in train_per_class[i]]
-            proportion = min(int(len(purified[i]) / total_data * size), len(purified[i]))
-            memo = random.sample(range(len(purified[i])), k = proportion)
-            memory = [purified[i][idx] for idx in memo]
+            proportion = min(int(len(train_per_class[i]) / total_data * size), len(train_per_class[i]))
+            memo = random.sample(range(len(train_per_class[i])), k = proportion)
+            memory = [train_per_class[i][idx] for idx in memo]
             memory = torch.from_numpy(np.array(memory))
             if replay_buffer == None:
                 replay_buffer = memory
@@ -23,55 +23,41 @@ def update_random(train_per_class, matching_index_inv, partition, task, size, re
     return replay_buffer
 
 
-def coverage_max(network, edge_index, type, method, train_per_class, matching_index_inv, size, replay, total_data, partition, task, features, adj, distance, distances, distances_mean, k_knn):
+def coverage_max(network, edge_index, train_per_class, size, replay, total_data, partition, task, features, distance):
     
     embeds = network.encode(features, edge_index)
     
-    purified = {}
     replay_buffer = None
-
-    for cla in partition[task]:
-        purified[cla] = [matching_index_inv[int(x)] for x in train_per_class[cla]]
-        distances[cla] = []
-        distances_mean[cla] = [] # to log mean distance between all pair of node features
 
     for cla in partition[task]:
         proportion = min(int(len(train_per_class[cla]) / total_data * size), len(train_per_class[cla]))
 
         count = 0
         memory = []
+        temp_memory = []
         cover = []
         
-        dist_matrix = torch.cdist(embeds[purified[cla]], embeds[purified[cla]], p=2)
-        
-        for idx in range(len(purified[cla])):
-            distances[cla].extend(dist_matrix[idx, idx:])
-        distances_mean[cla].append(torch.mean(torch.tensor(distances[cla])))
-        
+        dist_matrix = torch.cdist(embeds[train_per_class[cla]], embeds[train_per_class[cla]], p=2)
+        distances_mean = torch.mean(dist_matrix)
+        dist_bin_matrix = torch.where(dist_matrix<distances_mean.item()*distance,1,0)
+
+        temp_dist_bin_matrix = copy.deepcopy(dist_bin_matrix)
         while count < proportion:
-            cm = []
-            
-            for idx in range(len(purified[cla])):
-                if purified[cla][idx] in cover:
-                    cm.append([train_per_class[cla][idx], -1, []])
-                else:
-                    dist = pow(embeds[purified[cla][idx]]-embeds[purified[cla]],2)
-
-                    counts = np.sqrt(np.sum(dist.cpu().detach().numpy(),1))
-
-                    cm.append([train_per_class[cla][idx], len(list(set(np.where(counts<distances_mean[cla][0].item()*distance)[0]) - set(cover))), list(set(np.where(counts<distances_mean[cla][0].item()*distance)[0]) - set(cover))])
-
-            centrality = np.array([cm[ind][1] for ind in range(len(cm))])
-            
-            ind = centrality.argmax()
+            ind = (torch.sum(temp_dist_bin_matrix,0)).argmax()
             memory.append(train_per_class[cla][ind])
-            
-
-            cover = list(set(cover) | set(cm[ind][2]) | {ind})
+            temp_memory.append(ind)
+            target_dist_matrix = temp_dist_bin_matrix[ind,:]
+            new_cover = torch.where(target_dist_matrix==1)[0]
+            cover = list(set(cover) | set(new_cover))
+            temp_dist_bin_matrix[new_cover,:] = 0
+            temp_dist_bin_matrix[:,new_cover] = 0
 
             #reset
-            if len(cover) >= len(purified[cla]) * 0.8:
-                cover = [matching_index_inv[int(x)].item() for x in memory]
+            if len(cover) >= len(train_per_class[cla]) * 0.9:
+                cover = temp_memory
+                temp_dist_bin_matrix = copy.deepcopy(dist_bin_matrix)
+                temp_dist_bin_matrix[cover,:] = 0
+                temp_dist_bin_matrix[:,cover] = 0
 
             count += 1
         
@@ -92,129 +78,64 @@ def coverage_max(network, edge_index, type, method, train_per_class, matching_in
     return replay_buffer, replay
 
 
-def update_MF(network, edge_index, type, matching_index_inv, size, replay_buffer, total_data, partition, task, labels, train, features, adj, device, mean_features, count, dist, train_per_class, clustering, k):
+def update_MF(network, edge_index, type, size, replay_buffer, total_data, partition, task, labels, train, train_per_class, features, device, mean_features, count, dist):
 
     if type == 'embedding':
         embeds = network.encode(features, edge_index)
 
-    purified = [matching_index_inv[int(x)] for x in train[task]]
 
-    if clustering == 'yes':
-        purified_per_class = {}
+    for cla in partition[task]:
+        if type == 'feature':
+            mean_features[cla] = torch.zeros(len(features[0])).to(device)
+        elif type == 'embedding':
+            mean_features[cla] = torch.zeros(embeds.size(1)).to(device)
+        count[cla] = []
+        dist[cla] = []
 
-        for cla in partition[task]:
-            purified_per_class[cla] = [matching_index_inv[int(x)] for x in train_per_class[cla]]
-            mean_features[cla] = []
-            count[cla] = []
-            dist[cla] = []
+    for cla in partition[task]:
+        if type == 'feature':
+            mean_features[cla] = torch.mean(features[train_per_class[cla]], dim=0)
+        elif type == 'embedding':
+            mean_features[cla] = torch.mean(embeds[train_per_class[cla]], dim=0)
 
-            if type == 'feature':
-                cluster = KMeans(n_clusters = k, random_state=1, n_init=10).fit(features[purified_per_class[cla]].cpu())
-                cluster_ids_x = cluster.labels_
-                for i in range(k):
-                    mean_features[cla] += [torch.zeros(len(features[0])).to(device)]
-                    count[cla].append([])
-                    dist[cla].append([])
-                for j in range(len(cluster_ids_x)):
-                    mean_features[cla][cluster_ids_x[j]] += features[purified_per_class[cla][j]]
-                    count[cla][cluster_ids_x[j]].append(purified_per_class[cla][j])
-                for i in range(k):
-                    mean_features[cla][i] /= len(count[cla][i])
-            elif type == 'embedding':
-                cluster = KMeans(n_clusters = k, random_state=1, n_init=10).fit(embeds[purified_per_class[cla]].cpu())
-                cluster_ids_x = cluster.labels_
-                for i in range(k):
-                    mean_features[cla] += [torch.zeros(len(features[0])).to(device)]
-                    count[cla].append([])
-                    dist[cla].append([])
-                for j in range(len(cluster_ids_x)):
-                    mean_features[cla][cluster_ids_x[j]] += features[purified_per_class[cla][j]]
-                    count[cla][cluster_ids_x[j]].append(purified_per_class[cla][j])
-                embeds = embeds
-                for i in range(k):
-                    mean_features[cla][i] /= len(count[cla][i])
+    for cla in partition[task]:
+        if type == 'feature':
+            dist[cla] = torch.cdist(mean_features[cla].reshape(-1, mean_features[cla].size(0)), features[train_per_class[cla]], p=2)[0]
+        elif type == 'embedding':
+            dist[cla] = torch.cdist(mean_features[cla].reshape(-1, mean_features[cla].size(0)), embeds[train_per_class[cla]], p=2)[0]
 
-        for i in partition[task]:
-            #for j in range(k):
-            for j in range(len(count[i])):
-                for k in range(len(count[i][j])):
-                    if type == 'feature':
-                        dist[i][j].append([count[i][j][k], float(sum(pow(features[count[i][j][k]]-mean_features[i][j],2)))])
-                    elif type == 'embedding':
-                        dist[i][j].append([count[i][j][k], float(sum(pow(features[count[i][j][k]]-mean_features[i][j],2)))])
+    for cla in mean_features.keys():
+        proportion = min(int(len(train_per_class[cla]) / total_data * size), len(train_per_class[cla]))
+        v, i = dist[cla].topk(proportion)
+        memory = [train_per_class[cla][item] for item in i]
+        memory = torch.from_numpy(np.array(memory))
+        if replay_buffer == None:
+            replay_buffer = memory
+        else:
+            replay_buffer = torch.cat((replay_buffer, memory), 0)
 
-        for i in mean_features.keys():
-            for j in range(len(count[i])):
-                distt = np.array([dist[i][j][ind][1] for ind in range(len(dist[i][j]))])
-                proportion = min(int(len(count[i][j]) / total_data * size), len(count[i][j]))
-                ind = np.argpartition(distt, proportion)[:proportion]
-                memory = [dist[i][j][idx][0] for idx in ind]
-                memory = torch.from_numpy(np.array(memory))
-                if replay_buffer == None:
-                    replay_buffer = memory
-                else:
-                    replay_buffer = torch.cat((replay_buffer, memory),0)
-
-    elif clustering == 'no':
-        for cla in partition[task]:
-            if type == 'feature':
-                mean_features[cla] = torch.zeros(len(features[0])).to(device)
-            elif type == 'embedding':
-                mean_features[cla] = torch.zeros(embeds.size(1)).to(device)
-            count[cla] = []
-            dist[cla] = []
-
-        for i in range(len(purified)):
-            if type == 'feature':
-                mean_features[int(labels[purified[i]])] += features[purified[i]]
-            elif type == 'embedding':
-                mean_features[int(labels[purified[i]])] += embeds[purified[i]]
-            count[int(labels[purified[i]])].append(purified[i])
-
-        for i in partition[task]:
-            mean_features[i] /= len(count[i])
-            for j in range(len(count[i])):
-                if type == 'feature':
-                    dist[i].append([count[i][j], float(sum(pow(features[count[i][j]]-mean_features[i],2)))])
-                elif type == 'embedding':
-                    dist[i].append([count[i][j], float(sum(pow(embeds[count[i][j]]-mean_features[i],2)))]) #dist 계산
-            
-        for i in mean_features.keys():
-            distt = np.array([dist[i][ind][1] for ind in range(len(dist[i]))])
-            proportion = min(int(len(count[i]) / total_data * size), len(count[i]))
-            ind = np.argpartition(distt, proportion)[:proportion]
-            memory = [dist[i][idx][0] for idx in ind]
-            memory = torch.from_numpy(np.array(memory))
-            if replay_buffer == None:
-                replay_buffer = memory
-            else:
-                replay_buffer = torch.cat((replay_buffer, memory),0)
-    
     return replay_buffer, mean_features, count, dist
 
     
-def update_CM(network, edge_index, type, train_per_class, matching_index_inv, size, replay_buffer, total_data, partition, task, features, adj, cm, distance):
+def update_CM(network, edge_index, type, train_per_class, size, replay_buffer, total_data, partition, task, features, cm, distance):
     
     if type == 'embedding':
         embeds = network.encode(features, edge_index)
 
-    purified = {}
-
     for cla in partition[task]:
         cm[cla] = []
-        purified[cla] = [matching_index_inv[int(x)] for x in train_per_class[cla]]
 
     for cla in partition[task]:
         other_class = partition[task][:]
         other_class.remove(cla)
         other = []
         for clas in other_class:
-            other += purified[clas]
-        for idx in range(len(purified[cla])):
+            other += train_per_class[clas]
+        for idx in range(len(train_per_class[cla])):
             if type == 'feature':
-                dist = pow(features[purified[cla][idx]]-features[other],2)
+                dist = pow(features[train_per_class[cla][idx]]-features[other],2)
             elif type == 'embedding':
-                dist = pow(embeds[purified[cla][idx]]-embeds[other],2)
+                dist = pow(embeds[train_per_class[cla][idx]]-embeds[other],2)
             counts = np.sum(dist.cpu().detach().numpy(),1)
             cm[cla].append([train_per_class[cla][idx], len(counts[counts<distance])])
     
@@ -232,63 +153,39 @@ def update_CM(network, edge_index, type, train_per_class, matching_index_inv, si
     return replay_buffer, cm
 
 
-def homophily(index, adj, label):
-    adj_list = adj[index].nonzero()
-    degree = len(adj_list)
-    count = 0
-    for idx in adj_list:
-        if label[index] == label[idx]:
-            count += 1
-    homophily = count/len(adj_list) if degree != 0 else 0
 
-    return homophily
-
-
-def minmax(input):
-    min_scalar = np.min(input)
-    max_scalar = np.max(input)
-    boundary = max_scalar - min_scalar
-    temp = np.zeros(len(input))
-    min = temp + min_scalar
-    z = np.divide((input-min),boundary)
-
-    return z
-
-
-def update_replay(replay_type, method, network, edge_index, matching_index, matching_index_inv, size, replay_buffer, total_data, partition, task, labels, train, features, adj, device, train_per_class, clustering, k, distance, mean_features, count, dist, cm, replay, distances, distances_mean, homophily, degree, k_knn):
+def update_replay(replay_type, network, edge_index, size, replay_buffer, total_data, partition, task, labels, train, features, device, train_per_class, distance, mean_features, count, dist, cm, replay, homophily, degree):
     with torch.no_grad():
         if task == len(train)-1:
             pass
         else:
             if replay_type == 'random':
                 replay_buffer = None
-                replay_buffer = update_random(train_per_class, matching_index_inv, partition, task, size, replay_buffer, total_data)
-                replay_buffer = [matching_index[int(x)] for x in replay_buffer]
+                replay_buffer = update_random(train_per_class, partition, task, size, replay_buffer, total_data)
             elif replay_type == 'MFf':
                 if task == 0:
                     mean_features, count, dist = {}, {}, {}
                 replay_buffer = None
-                replay_buffer, mean_features, count, dist = update_MF(network, edge_index, 'feature', matching_index_inv, size, replay_buffer, total_data, partition, task, labels, train, features, adj, device, mean_features, count, dist, train_per_class, clustering, k)
-                replay_buffer = [matching_index[int(x)] for x in replay_buffer]
+                replay_buffer, mean_features, count, dist = update_MF(network, edge_index, 'feature', size, replay_buffer, total_data, partition, task, labels, train, train_per_class, features, device, mean_features, count, dist)
             elif replay_type == 'MFe':
                 if task == 0:
                     mean_features, count, dist = {}, {}, {}
                 replay_buffer = None
-                replay_buffer, mean_features, count, dist = update_MF(network, edge_index, 'embedding', matching_index_inv, size, replay_buffer, total_data, partition, task, labels, train, features, adj, device, mean_features, count, dist, train_per_class, clustering, k)
-                replay_buffer = [matching_index[int(x)] for x in replay_buffer]
+                replay_buffer, mean_features, count, dist = update_MF(network, edge_index, 'embedding', size, replay_buffer, total_data, partition, task, labels, train, train_per_class, features, device, mean_features, count, dist)
             elif replay_type == 'CMf':
                 if task == 0:
                     cm = {}
                 replay_buffer = None
-                replay_buffer, cm = update_CM(network, edge_index, 'feature', train_per_class, matching_index_inv, size, replay_buffer, total_data, partition, task, features, adj, cm, distance)
+                replay_buffer, cm = update_CM(network, edge_index, 'feature', train_per_class, size, replay_buffer, total_data, partition, task, features, cm, distance)
             elif replay_type == 'CMe':
                 if task == 0:
                     cm = {}
                 replay_buffer = None
-                replay_buffer, cm = update_CM(network, edge_index, 'embedding', train_per_class, matching_index_inv, size, replay_buffer, total_data, partition, task, features, adj, cm, distance)
+                replay_buffer, cm = update_CM(network, edge_index, 'embedding', train_per_class, size, replay_buffer, total_data, partition, task, features, cm, distance)
             elif replay_type =='CD':
                 if task == 0:
-                    replay, distances, distances_mean = {}, {}, {}
-                replay_buffer, replay = coverage_max(network, edge_index, 'embedding', 'threshold', train_per_class, matching_index_inv, size, replay, total_data, partition, task, features, adj, distance, distances, distances_mean, k_knn)
+                    replay = {}
+                replay_buffer, replay = coverage_max(network, edge_index, train_per_class, size, replay, total_data, partition, task, features, distance)
 
-    return replay_buffer, mean_features, count, dist, cm, replay, distances, distances_mean, homophily, degree
+
+    return replay_buffer, mean_features, count, dist, cm, replay, homophily, degree

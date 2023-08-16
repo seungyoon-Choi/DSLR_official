@@ -33,9 +33,9 @@ def main(args):
 
 
     # load the data
-    adj_ori, features_ori, labels_ori, train, total_classes, partition, train_per_class, test_per_class, class_idx = load_data(args, dataset = args.dataset, classes_per_task=args.classes_per_task)
-    features_ori = features_ori.to(device)
-    labels_ori = labels_ori.to(device)
+    edge_index_ori, features_ori, labels_ori, train, total_classes, partition, train_per_class, test_per_class, class_idx = load_data(args, dataset = args.dataset, classes_per_task=args.classes_per_task)
+    features = features_ori.to(device)
+    labels = labels_ori.to(device)
 
     #Train
     replay_buffer = None
@@ -46,14 +46,8 @@ def main(args):
     acc = {}
     acc_class = {}
     current_accs = []
-    buffer = {}
-    buf_homophily = []
-    for i in range(args.classes_per_task * (len(train)-1)):
-        buf_homophily.append([])
-    test_accuracy = {}
+    
     train_per_class_idx = []
-    for i in range(6):
-        test_accuracy[i] = []
 
     for task in range(len(train)):
 
@@ -61,35 +55,20 @@ def main(args):
             handle += 1
             for node in class_idx[cla]:
                 handled.append(node)
-            buffer[cla] = []
         
         acc[task] = []
         for i in range(args.classes_per_task*task, args.classes_per_task*(task+1)):
             acc_class[i] = []
 
-        matching_index = {} #changed -> original
-        matching_index_inv = {} #original -> changed
-        for idx in range(len(handled)):
-            matching_index[idx] = handled[idx]
-            matching_index_inv[int(handled[idx])] = torch.tensor(idx)
-
-
-        train_idx = []
-        val_idx = []
-        test_idx = []
-        whole_test_idx = []
-        replay_idx = []
-        current_idx = []
-        test_idx_per_class = []
+        train_idx, val_idx, test_idx, whole_test_idx, replay_idx, current_idx, test_idx_per_class = [], [], [], [], [], [], []
 
         for i in partition[task]:
-            train_idx += [matching_index_inv[int(x)] for x in train_per_class[i]]
-            current_idx += [matching_index_inv[int(x)] for x in train_per_class[i]]
+            train_idx += train_per_class[i]
+            current_idx += train_per_class[i]
             train_per_class_idx.append([])
-            train_per_class_idx[i] += [matching_index_inv[int(x)] for x in train_per_class[i]]
+            train_per_class_idx[i] += train_per_class[i]
         if replay_buffer != None:
-            train_idx += [matching_index_inv[int(x)] for x in replay_buffer]
-            replay_idx += [matching_index_inv[int(x)] for x in replay_buffer]
+            train_idx += replay_buffer
 
         total_data = 0
 
@@ -97,49 +76,24 @@ def main(args):
             test_idx.append([])
             val_idx.append([])
             for i in partition[tasks]:
-                test_idx[tasks] += [matching_index_inv[int(x)] for x in test_per_class[i]]
-                whole_test_idx += [matching_index_inv[int(x)] for x in test_per_class[i]]
+                test_idx[tasks] += test_per_class[i]
+                whole_test_idx += test_per_class[i]
                 total_data += len(train_per_class[i])
                 test_idx_per_class.append([])
-                test_idx_per_class[i] += [matching_index_inv[int(x)] for x in test_per_class[i]]
+                test_idx_per_class[i] += test_per_class[i]
 
-        if task != 0:
-            buf = torch.tensor([matching_index_inv[int(x)] for x in replay_buffer])
-            buf_per_class = {}
-            for classs in range(task*args.classes_per_task):
-                buf_per_class[classs] = []
-            for i in buf:
-                buf_per_class[int(labels[i])].append(i)
-
-
-        #update adjacency
-        if task == 0:
-            ori_edge_index = adjacency_to_edge_index(adj_ori, device)
-        else:
-            adj_ori = edge_index_to_adjacency(ori_edge_index, adj_ori.size(0), device)
-        adj = adj_masking(adj_ori, handled, device)
-        features = feature_masking(features_ori, handled)
-        labels = label_masking(labels_ori, handled)
-        
+        #update edge index
+        edge_index = edge_masking(edge_index_ori, handled, device)
         
         if task == 0:
             F = features.size(1) # num_of_features
             H = args.hidden # hidden nodes
             C = args.classes_per_task
-            if args.model == "GCN":
-                model_lp = GCN(F, H, C, task, adj, args.dropout).to(device)
-            elif args.model == "GAT":
-                model_lp = GAT(F, H, C, args.n_heads, task, adj, args.dropout).to(device)
+            if args.model == "GAT":
+                model_lp = GAT(F, H, C, args.n_heads, task, args.dropout).to(device)
         elif task != 0:
             model_lp.load_state_dict(torch.load('checkpoints/%d.pt' %(task-1)))
-            if args.model == "GCN":
-                weight_expand = torch.rand(C,H).to(device)
-                bias_expand = torch.rand(C).to(device)
-                new_weight = torch.cat((model_lp.classifier.weight, weight_expand),0)
-                new_bias = torch.cat((model_lp.classifier.bias, bias_expand),0)
-                model_lp.classifier.weight = nn.Parameter(new_weight)
-                model_lp.classifier.bias = nn.Parameter(new_bias)
-            elif args.model == "GAT":
+            if args.model == "GAT":
                 weight_expand = torch.rand(C,H*args.n_heads).to(device)
                 bias_expand = torch.rand(C).to(device)
                 new_weight = torch.cat((model_lp.classifier.weight, weight_expand),0)
@@ -148,27 +102,16 @@ def main(args):
                 model_lp.classifier.bias = nn.Parameter(new_bias)
 
             model_lp.task = task
-            model_lp.ori_adj = adj
 
 
-        edge_index = adjacency_to_edge_index(adj, device)
         data = Data(x=features, edge_index = edge_index, y = labels)
-        data.num_nodes = adj.size(0)
         data.train_mask = data.val_mask = data.test_mask = None
 
-
-        
-                
         ##Structure learning for replay buffer
         if task != 0 and args.structure == 'yes':
             
-            model_lp, ori_edge_index = buffer_linkpred(model_lp, data, features, adj, train_idx, current_idx, replay_idx, 0.1, matching_index_inv, matching_index, replay_buffer, ori_edge_index, device, args.k_knn, args.threshold, args.beta, args.replay)
-            
-            adj_ori = edge_index_to_adjacency(ori_edge_index, adj_ori.size(0), device)
-            adj = adj_masking(adj_ori, handled, device)
-            edge_index = adjacency_to_edge_index(adj, device)
+            model_lp, edge_index = buffer_linkpred(model_lp, data, features, train_idx, current_idx, replay_buffer, edge_index, device, args.k_knn, args.threshold, args.beta, args.replay)
             data.edge_index = edge_index
-            model_lp.ori_adj = adj
 
 
         network = model_lp
@@ -187,14 +130,14 @@ def main(args):
                 train_loss = criterion(preds[train_idx], labels[train_idx]) 
             elif task != 0:
                 current_loss = criterion(preds[current_idx], labels[current_idx])
-                replay_loss = criterion(torch.index_select(preds.to(device), 0, torch.tensor(replay_idx).to(device)), torch.index_select(labels.to(device), 0, torch.tensor(replay_idx).to(device)))
-
+                replay_loss = criterion(preds[replay_buffer], labels[replay_buffer])
+                
                 if args.beta == 0:
-                    beta = len(replay_idx)/(len(current_idx)+len(replay_idx))
+                    beta = len(replay_buffer)/(len(current_idx)+len(replay_buffer))
                 else:
                     beta = args.beta
 
-                if len(replay_idx) == 0:
+                if len(replay_buffer) == 0:
                     train_loss = current_loss
                 else:
                     train_loss = beta * current_loss + (1-beta) * replay_loss
@@ -212,10 +155,9 @@ def main(args):
 
         # update replay buffer
         if task == 0:
-            mean_features = count = dist = cm = replay = distances = distances_mean = homophily = degree = None
-        replay_buffer, mean_features, count, dist, cm, replay, distances, distances_mean, homophily, degree = update_replay(args.replay, args.method, network, edge_index, matching_index, matching_index_inv, args.memory_size, replay_buffer, total_data, partition, task, labels, train, features, adj, device, train_per_class, args.clustering, args.k, args.distance, mean_features, count, dist, cm, replay, distances, distances_mean, homophily, degree, args.k_knn)
-        
-        
+            mean_features = count = dist = cm = replay = homophily = degree = None
+        replay_buffer, mean_features, count, dist, cm, replay, homophily, degree = update_replay(args.replay, network, edge_index, args.memory_size, replay_buffer, total_data, partition, task, labels, train, features, device, train_per_class, args.distance, mean_features, count, dist, cm, replay, homophily, degree)
+
         # Test
         with torch.no_grad():
             network.eval()
@@ -242,7 +184,8 @@ def main(args):
                     acc_analysis = [i.item() for i in acc_analysis]
                     acc_class[classs].append(test_acc_per_class)
                     print('%d. Test Accuracy for class %s : %.2f'%(classs, str(classs), test_acc_per_class * 100))
-                    print('%d. Test Prediction for class %s : %s' %(classs, str(classs), acc_analysis))
+                    #print('%d. Test Prediction for class %s : %s' %(classs, str(classs), acc_analysis))
+                    
 
             accs.append(test_acc)
             
@@ -256,11 +199,12 @@ def main(args):
         print('Average Performance for last task : %.2f'%(current_performance(acc)))
         print('Forgetting Performance : %.2f'%(forget_performance(acc, args.classes_per_task, args.forget)))
 
+
     elif args.forget == 'class':
         print('Average Performance : %.2f'%(average_performance(acc_class)))
         print('Average Performance for last task : %.2f'%(current_performance(acc_class)))
         print('Forgetting Performance : %.2f'%(forget_performance(acc_class, args.classes_per_task, args.forget)))
-        
+
     
 
     
@@ -279,7 +223,6 @@ def current_performance(acc):
 
 def forget_performance(acc, classes_per_task, forget):
     sum = 0
-    #count = 0
     for task in acc.keys():
         sum += (acc[task][0]-acc[task][-1])
     if forget == 'task':
@@ -293,9 +236,9 @@ if __name__  == "__main__":
     
     # Training settings
     parser = argparse.ArgumentParser()
-    parser.add_argument('--classes_per_task', type=int, default=2, help='classes per task')
+    parser.add_argument('--classes_per_task', type=int, default=3, help='classes per task')
     parser.add_argument('--replay', type=str, default='CD', choices=['random', 'MFf', 'MFe', 'CMf', 'CMe', 'CD'], help='replay method')
-    parser.add_argument('--memory_size', type=int, default = 100, help='replay buffer size')
+    parser.add_argument('--memory_size', type=int, default = 3000, help='replay buffer size')
     parser.add_argument('--no-cuda', action='store_true', default=False, help='Disables CUDA training.')
     parser.add_argument('--fastmode', action='store_true', default=False, help='Validate during training pass.')
     parser.add_argument('--sparse', action='store_true', default=False, help='GAT with sparse version or not.')
@@ -309,17 +252,13 @@ if __name__  == "__main__":
     parser.add_argument('--dropout', type=float, default=0.3, help='Dropout rate (1 - keep probability).')
     parser.add_argument('--alpha', type=float, default=0.2, help='Alpha for the leaky_relu.')
     parser.add_argument('--patience', type=int, default=10, help='patience')
-    parser.add_argument('--dataset', type=str, default='citeseer', choices=['amazoncobuy','cora','citeseer', 'ogb_arxiv'], help='Dataset to train.')
+    parser.add_argument('--dataset', type=str, default='ogb_arxiv', choices=['amazoncobuy','cora','citeseer', 'ogb_arxiv'], help='Dataset to train.')
     parser.add_argument('--model', type=str, default='GAT', choices=['GCN','GAT'], help='Model to train.')
-    parser.add_argument('--clustering', type=str, default='no', choices=['yes', 'no'], help='diversity')
-    parser.add_argument('--k', type=int, default=4, help = 'num of clusters of each class')
     parser.add_argument('--seed_shuffle', type=int, default=4, help = 'task sequence shuffle')
     parser.add_argument('--incremental', type=str, default='class', choices=['class', 'task'], help='incremental type')
-    parser.add_argument('--distance', type=float, default=0.2, help='distance threshold in CM')
+    parser.add_argument('--distance', type=float, default=0.1, help='distance threshold in CM')
     parser.add_argument('--structure', type=str, default='yes', choices=['yes', 'no'], help='supervised structure learning for buffer')
-    parser.add_argument('--method', type=str, default='threshold', choices=['threshold', 'knn'], help='select criteria')
     parser.add_argument('--k_knn', type=int, default=5, help='knn for replay buffer')
-    parser.add_argument('--virtual_node', type=str, default='no', choices=['yes', 'no'], help='presence or absence of virtual node')
     parser.add_argument('--beta', type=float, default=0.1, help='weight in loss function')
     parser.add_argument('--threshold', type=float, default=0.99, help='Link prediction threshold')
     parser.add_argument('--forget', type=str, default='class', choices=['task', 'class'], help='Forgetting Calculation Criteria')
