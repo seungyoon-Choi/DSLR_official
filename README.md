@@ -16,13 +16,13 @@ Continual learning method with replay approach on graph structured data. The str
 <pre>
 <code>
 1. Cora
-python train.py --dataset cora --replay CD --structure yes --classes_per_task 2 --replay 100
+python train.py --dataset cora --replay CD --structure yes --classes_per_task 2 --memory_size 100
 
 2. Amazon Computer
-python train.py --dataset amazoncobuy --replay CD --structure yes --classes_per_task 2 --replay 200
+python train.py --dataset amazoncobuy --replay CD --structure yes --classes_per_task 2 --memory_size 200
 
 3. OGB-arxiv
-python train.py --dataset ogb_arxiv --replay CD --structure yes --classes_per_task 3 --replay 3000
+python train.py --dataset ogb_arxiv --replay CD --structure yes --classes_per_task 3 --memory_size 3000
 
 </code>
 </pre>
